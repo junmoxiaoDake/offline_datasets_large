@@ -1,0 +1,407 @@
+import datetime
+import os
+import pprint
+import time
+import threading
+import torch as th
+import h5py
+import sys
+from types import SimpleNamespace as SN
+from utils.logging import Logger
+from utils.timehelper import time_left, time_str
+from os.path import dirname, abspath
+
+from learners import REGISTRY as le_REGISTRY
+from runners import REGISTRY as r_REGISTRY
+from controllers import REGISTRY as mac_REGISTRY
+from components.episode_buffer import ReplayBuffer
+from components.transforms import OneHot
+
+from smac.env import StarCraft2Env
+import numpy as np
+
+def get_agent_own_state_size(env_args):
+    sc_env = StarCraft2Env(**env_args)
+    # qatten parameter setting (only use in qatten)
+    return  4 + sc_env.shield_bits_ally + sc_env.unit_type_bits
+
+def run(_run, _config, _log):
+
+    # check args sanity
+    _config = args_sanity_check(_config, _log)
+
+    args = SN(**_config)
+    args.device = "cuda" if args.use_cuda else "cpu"
+
+    # setup loggers
+    logger = Logger(_log)
+
+    _log.info("Experiment Parameters:")
+    experiment_params = pprint.pformat(_config,
+                                       indent=4,
+                                       width=1)
+    _log.info("\n\n" + experiment_params + "\n")
+
+    # configure tensorboard logger
+    unique_token = "{}__{}".format(args.name, datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    args.unique_token = unique_token
+    if args.use_tensorboard:
+        tb_logs_direc = os.path.join(dirname(dirname(abspath(__file__))), "results", "tb_logs")
+        tb_exp_direc = os.path.join(tb_logs_direc, "{}").format(unique_token)
+        logger.setup_tb(tb_exp_direc)
+
+    # sacred is on by default
+    logger.setup_sacred(_run)
+
+    # Run and train
+    run_sequential(args=args, logger=logger)
+
+    # Clean up after finishing
+    print("Exiting Main")
+
+    print("Stopping all threads")
+    for t in threading.enumerate():
+        if t.name != "MainThread":
+            print("Thread {} is alive! Is daemon: {}".format(t.name, t.daemon))
+            t.join(timeout=1)
+            print("Thread joined")
+
+    print("Exiting script")
+
+    # Making sure framework really exits
+    os._exit(os.EX_OK)
+
+
+def evaluate_sequential(args, runner):
+
+    for _ in range(args.test_nepisode):
+        runner.run(test_mode=True)
+
+    if args.save_replay:
+        runner.save_replay()
+
+    runner.close_env()
+
+def run_sequential(args, logger):
+
+    is_res_qmix = getattr(args, 'res', False) #added 20220825
+    # Init runner so we can get env info
+    runner = r_REGISTRY[args.runner](args=args, logger=logger)
+
+    # Set up schemes and groups here
+    env_info = runner.get_env_info()
+    args.n_agents = env_info["n_agents"]
+    args.n_actions = env_info["n_actions"]
+    args.state_shape = env_info["state_shape"]
+
+    if getattr(args, 'agent_own_state_size', False):
+        args.agent_own_state_size = get_agent_own_state_size(args.env_args)
+
+    # Default/Base scheme
+    scheme = {
+        "state": {"vshape": env_info["state_shape"]},
+        "obs": {"vshape": env_info["obs_shape"], "group": "agents"},
+        "actions": {"vshape": (1,), "group": "agents", "dtype": th.long},
+        "avail_actions": {"vshape": (env_info["n_actions"],), "group": "agents", "dtype": th.int},
+        "probs": {"vshape": (env_info["n_actions"],), "group": "agents", "dtype": th.float},
+        "reward": {"vshape": (1,)},
+        "terminated": {"vshape": (1,), "dtype": th.uint8},
+    }
+    if is_res_qmix:
+        scheme['future_discounted_return'] = {"vshape": (1,)}
+
+    groups = {
+        "agents": args.n_agents
+    }
+    preprocess = {
+        "actions": ("actions_onehot", [OneHot(out_dim=args.n_actions)])
+    }
+
+    buffer = ReplayBuffer(scheme, groups, args.buffer_size, env_info["episode_limit"] + 1,
+                          preprocess=preprocess,
+                          device="cpu" if args.buffer_cpu_only else args.device)
+    # Setup multiagent controller here
+    # 控制并选取动作
+    mac = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
+
+    # Give runner the scheme
+    runner.setup(scheme=scheme, groups=groups, preprocess=preprocess, mac=mac)
+
+    # Learner
+    learner = le_REGISTRY[args.learner](mac, buffer.scheme, logger, args)
+
+    if args.use_cuda:
+        learner.cuda()
+
+    if args.checkpoint_path != "" and not hasattr(args, 'if_collect_data') :
+
+        timesteps = []
+        timestep_to_load = 0
+
+        if not os.path.isdir(args.checkpoint_path):
+            logger.console_logger.info("Checkpoint directiory {} doesn't exist".format(args.checkpoint_path))
+            return
+
+        # Go through all files in args.checkpoint_path
+        for name in os.listdir(args.checkpoint_path):
+            full_name = os.path.join(args.checkpoint_path, name)
+            # Check if they are dirs the names of which are numbers
+            if os.path.isdir(full_name) and name.isdigit():
+                timesteps.append(int(name))
+
+        if args.load_step == 0:
+            # choose the max timestep
+            timestep_to_load = max(timesteps)
+        else:
+            # choose the timestep closest to load_step
+            timestep_to_load = min(timesteps, key=lambda x: abs(x - args.load_step))
+
+        model_path = os.path.join(args.checkpoint_path, str(timestep_to_load))
+
+        logger.console_logger.info("??_Loading model from {}".format(model_path))
+        learner.load_models(model_path)
+        runner.t_env = timestep_to_load
+
+        if args.evaluate or args.save_replay:
+            evaluate_sequential(args, runner)
+            return
+    #是否需要保存轨迹
+    if args.if_collect_data:
+        
+        data_quality_maps = {
+            '3m':
+            {
+                'expert' : 2000000,
+                'medium' : 1000000
+            },
+            '3s_vs_5z':
+            {
+                'expert' : 2000000,
+                'medium' : 1000000
+            },
+            'MMM2':
+            {
+                'expert' : 2000000,
+                'medium' : 1000000
+            },
+            '2c_vs_64zg':
+            {
+                'expert' : 2000000,
+                'medium' : 1000000,
+            },
+            '2s_vs_1sc' :
+            {
+                'expert' : 2000000,
+                'medium' : 1000000,
+            },
+            '27m_vs_30m' :
+            {
+                'expert' : 2000000,
+                'medium' : 1000000,
+            },
+            '5m_vs_6m' :
+            {
+                'expert' : 2000000,
+                'medium' : 1000000,
+            },
+            '3c9s15z' :
+            {
+                'expert' : 2000000,
+                'medium' : 1000000,
+            },
+            '8m_vs_9m' :
+            {
+                'expert' : 2000000,
+                'medium' : 1000000,
+            },
+            '45m_vs_50m' :
+            {
+                'expert' : 2000000,
+                'medium' : 1000000,
+            },
+            'MMM3' :
+            {
+                'expert' : 2000000,
+                'medium' : 1000000,
+            },
+            'MMM4' :
+            {
+                'expert' : 2000000,
+                'medium' : 1000000,
+            },
+            '100m_vs_100m' :
+            {
+                'expert' : 2000000,
+                'medium' : 1000000,
+            }
+        }
+        timesteps = []
+        for name in os.listdir(args.checkpoint_path):
+            full_name = os.path.join(args.checkpoint_path, name)
+            if os.path.isdir(full_name) and name.isdigit():
+                timesteps.append(int(name))
+
+        # 基于数据质量，确定读取的model
+        desired_timestep = data_quality_maps[args.env_args['map_name']][args.data_quality]
+        time_to_load = min(timesteps, key = lambda x : abs(x - desired_timestep))
+
+        model_path = os.path.join(args.checkpoint_path, str(time_to_load))
+        logger.console_logger.info("HH_Loading model from {}".format(model_path))
+        learner.load_models(model_path)
+        runner.t_env = time_to_load
+
+        # 创建一个DataSaver 实例
+        # data_save_path = os.path.join(args.local_result_path, "dataset", args.map_name, args.data_quality)
+        # data_sever = DataSaver(datadir=data_save_path, max_size=args.save_interval)
+
+        # 其最大轨迹数量
+        max_trajectories = args.max_trajectories if hasattr(args, 'max_trajectories') else float('inf')
+        trajectory_data = {
+            'actions': np.zeros((max_trajectories, runner.episode_limit + 1, args.n_agents, 1)),
+            'actions_onehot': np.zeros((max_trajectories, runner.episode_limit + 1, args.n_agents, args.n_actions)),
+            'avail_actions': np.zeros((max_trajectories, runner.episode_limit + 1, args.n_agents, args.n_actions)),
+            'filled': np.zeros((max_trajectories, runner.episode_limit + 1, 1)),
+            'obs': np.zeros((max_trajectories, runner.episode_limit + 1, args.n_agents, env_info["obs_shape"])),
+            'reward': np.zeros((max_trajectories, runner.episode_limit + 1, 1)),
+            'state': np.zeros((max_trajectories, runner.episode_limit + 1, env_info["state_shape"])),
+            'terminated': np.zeros((max_trajectories, runner.episode_limit + 1, 1))
+        }
+        trajectory_idx  =  0 
+        while trajectory_idx < max_trajectories:
+            trajectory, episode_batch = runner.run(test_mode=False)
+            # 把trajectory数据添加到trajectory_data中
+            trajectory_data['actions'][trajectory_idx] = trajectory['actions']
+            trajectory_data['actions_onehot'][trajectory_idx] = trajectory['actions_onehot']
+            trajectory_data['avail_actions'][trajectory_idx] = trajectory['avail_actions']
+            trajectory_data['filled'][trajectory_idx] = trajectory['filled']
+            trajectory_data['obs'][trajectory_idx] = trajectory['obs']
+            trajectory_data['reward'][trajectory_idx] = trajectory['reward']
+            trajectory_data['state'][trajectory_idx] = trajectory['state']
+            trajectory_data['terminated'][trajectory_idx] = trajectory['terminated']
+
+            # # 使用DataSaver 的 append 方法保存轨迹
+            # data_sever.append(trajectory_data)
+            # 保存buffer
+            # buffer.insert_episode_batch(episode_batch)
+
+            trajectory_idx += 1
+            logger.console_logger.info("trajectory_idx: {}".format(trajectory_idx))
+        
+        data_save_path = os.path.join(args.local_results_path, "dataset", args.env_args['map_name'], args.data_quality)
+
+        os.makedirs(data_save_path, exist_ok=True)
+        logger.console_logger.info("Saving data to {}".format(data_save_path))
+
+        # 检查文件是否已存在
+        index = 0
+        file_name = 'part_{}.h5'.format(index)
+        while os.path.exists(os.path.join(data_save_path, file_name)):
+            index += 1
+            file_name = "part_{}.h5".format(index)
+        
+        # 保存数据
+        with h5py.File(os.path.join(data_save_path, file_name), 'w') as file:
+            for key, value in trajectory_data.items():
+                file.create_dataset(key, data=value,  compression='gzip', compression_opts=9)
+        
+        runner.close_env()
+        logger.console_logger.info("Finished collect data")
+        sys.exit()
+
+    # start training
+    episode = 0
+    last_test_T = -args.test_interval - 1
+    last_log_T = 0
+    model_save_time = 0
+
+    start_time = time.time()
+    last_time = start_time
+
+    logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
+
+    while runner.t_env <= args.t_max:
+
+        # Run for a whole episode at a time
+
+        with th.no_grad():
+            episode_batch = runner.run(test_mode=False)
+            if is_res_qmix:
+                # episode_batch.data.transition_data['reward']: 1, episode_len + 1, 1
+                episode_batch_rewards = episode_batch.data.transition_data['reward'].squeeze(-1).squeeze(0)
+                reward_lens = episode_batch_rewards.shape[0]
+                episode_batch_future_discounted_returns = np.zeros((reward_lens,))
+                # episode_batch_future_discounted_returns = [0 for _ in range(reward_lens)]
+                future_discounted_return = 0.
+                for step_idx in range(reward_lens - 1, -1, -1):
+                    future_discounted_return = episode_batch_rewards[step_idx] + args.gamma * future_discounted_return
+                    episode_batch_future_discounted_returns[step_idx] = future_discounted_return
+
+                episode_batch_future_discounted_returns = th.tensor(episode_batch_future_discounted_returns).unsqueeze(
+                    0).unsqueeze(-1).cuda()
+                episode_batch.data.transition_data['future_discounted_return'] = episode_batch_future_discounted_returns
+
+                assert len(episode_batch.data.episode_data.items()) == 0
+            buffer.insert_episode_batch(episode_batch)
+
+        if buffer.can_sample(args.batch_size):
+            episode_sample = buffer.sample(args.batch_size)
+
+            # Truncate batch to only filled timesteps
+            max_ep_t = episode_sample.max_t_filled()
+            episode_sample = episode_sample[:, :max_ep_t]
+
+            if episode_sample.device != args.device:
+                episode_sample.to(args.device)
+
+            learner.train(episode_sample, runner.t_env, episode)
+            del episode_sample
+
+        # Execute test runs once in a while
+        n_test_runs = max(1, args.test_nepisode // runner.batch_size)
+        if (runner.t_env - last_test_T) / args.test_interval >= 1.0:
+
+            logger.console_logger.info("t_env: {} / {}".format(runner.t_env, args.t_max))
+            logger.console_logger.info("Estimated time left: {}. Time passed: {}".format(
+                time_left(last_time, last_test_T, runner.t_env, args.t_max), time_str(time.time() - start_time)))
+            last_time = time.time()
+
+            last_test_T = runner.t_env
+            for _ in range(n_test_runs):
+                runner.run(test_mode=True)
+
+        if args.save_model and (runner.t_env - model_save_time >= args.save_model_interval or model_save_time == 0):
+            model_save_time = runner.t_env
+            save_path = os.path.join(args.local_results_path, "models", args.env_args['map_name'], args.unique_token, str(runner.t_env))
+            #"results/models/{}".format(unique_token)
+            os.makedirs(save_path, exist_ok=True)
+            logger.console_logger.info("Saving models to {}".format(save_path))
+
+            # learner should handle saving/loading -- delegate actor save/load to mac,
+            # use appropriate filenames to do critics, optimizer states
+            learner.save_models(save_path)
+
+        episode += args.batch_size_run
+
+        if (runner.t_env - last_log_T) >= args.log_interval:
+            logger.log_stat("episode", episode, runner.t_env)
+            logger.print_recent_stats()
+            last_log_T = runner.t_env
+
+    runner.close_env()
+    logger.console_logger.info("Finished Training")
+
+
+def args_sanity_check(config, _log):
+
+    # set CUDA flags
+    # config["use_cuda"] = True # Use cuda whenever possible!
+    if config["use_cuda"] and not th.cuda.is_available():
+        config["use_cuda"] = False
+        _log.warning("CUDA flag use_cuda was switched OFF automatically because no CUDA devices are available!")
+
+    if config["test_nepisode"] < config["batch_size_run"]:
+        config["test_nepisode"] = config["batch_size_run"]
+    else:
+        config["test_nepisode"] = (config["test_nepisode"]//config["batch_size_run"]) * config["batch_size_run"]
+
+    return config
