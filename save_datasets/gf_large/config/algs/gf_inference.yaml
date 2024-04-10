@@ -1,0 +1,70 @@
+#--- VDN specific parameters ---
+# Monte Carlo Q_tot Learning
+
+# use epsilon greedy action selector
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 100000
+
+runner: "episode"
+batch_size_run: 1
+buffer_size: 2000
+batch_size: 128
+
+t_max: 1050000
+
+# update the target network every {} episodes
+target_update_interval: 1
+
+# use the Q_Learner to train
+mac: "n_mac"
+agent: "n_rnn" 
+agent_output_type: q
+rnn_hidden_dim: 256
+
+learner: "nq_learner"
+mixer: "vdn"
+lr: 0.0005 # Learning rate for agents
+td_lambda: 1.0
+optimizer: 'adam'
+gamma: 0.999
+
+# orthogonal init for DNN
+use_orthogonal: False
+gain: 0.01
+
+# rnn layer normalization
+use_layer_norm: False
+
+# Priority experience replay
+use_per: False
+per_alpha: 0.6
+per_beta: 0.4
+return_priority: True
+
+name: "gf_inference"
+
+#save_model: True
+#save_model_interval: 100000
+
+
+#expert
+#medium
+data_quality: "expert"
+if_collect_data : True
+
+checkpoint_path: "/data/zpq/code_135/test_google_football/pymarl2-master/src/results/models/11_vs_11_competition/orginal_gfootball__2024-01-16_14-46-57"
+
+
+#checkpoint_path: "/data/zpq/code_135/test_google_football/pymarl2-master/src/results/models/11_vs_11_easy_stochastic/orginal_gfootball__2024-01-16_11-10-04"
+
+#checkpoint_path: "/data/zpq/code_135/test_google_football/pymarl2-master/src/results/models/11_vs_11_hard_stochastic/orginal_gfootball__2024-01-16_11-10-32"
+
+#checkpoint_path: "/data/zpq/code_135/test_google_football/pymarl2-master/src/results/models/11_vs_11_kaggle/orginal_gfootball__2024-01-16_11-10-37"
+
+#checkpoint_path: "/data/zpq/code_135/test_google_football/pymarl2-master/src/results/models/21_vs_21_hard/orginal_gfootball__2024-01-16_11-10-55"
+
+#checkpoint_path: "/data/zpq/code_135/test_google_football/pymarl2-master/src/results/models/academy_counterattack_hard_large/orginal_gfootball__2024-01-16_11-11-10"
+
+max_trajectories: 2000
